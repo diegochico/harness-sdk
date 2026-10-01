@@ -9,7 +9,7 @@ import logging
 import mimetypes
 from collections.abc import AsyncGenerator, AsyncIterator
 from contextlib import asynccontextmanager
-from typing import Any, Protocol, TypeVar, cast
+from typing import Any, Literal, Protocol, TypeVar, cast
 
 import openai
 from openai.types.chat.parsed_chat_completion import ParsedChatCompletion
@@ -60,7 +60,10 @@ class OpenAIModel(Model):
             stream: Whether to use OpenAI chat completion streaming. Defaults to True.
             cache_config: Prompt-caching configuration. OpenAI routes cache reads on
                 ``cache_key`` (mapped to ``prompt_cache_key``) and honors ``ttl`` only when it names
-                an OpenAI retention value; other fields have no effect. An explicit
+                an OpenAI retention value. A caller-placed system prompt ``cachePoint`` maps to
+                OpenAI's native ``prompt_cache_breakpoint`` by default, or to an Anthropic/Bedrock-
+                compatible ``cache_control`` field when ``strategy="anthropic"`` (for gateways that
+                proxy to those providers); other fields have no effect. An explicit
                 ``prompt_cache_key``/``prompt_cache_retention`` in ``params`` takes precedence.
         """
 
@@ -365,19 +368,23 @@ class OpenAIModel(Model):
         system_prompt: str | None = None,
         *,
         system_prompt_content: list[SystemContentBlock] | None = None,
+        cache_strategy: Literal["auto", "anthropic"] | None = None,
         **kwargs: Any,
     ) -> list[dict[str, Any]]:
         """Format system messages for OpenAI-compatible providers.
 
-        A caller-placed ``cachePoint`` block marks the preceding system text block as cacheable,
-        emitted as an Anthropic/Bedrock-compatible ``cache_control`` field on that block's content
-        part. Plain OpenAI has no such field and ignores it; gateways in front of Anthropic or
-        Bedrock (Portkey, LiteLLM, OpenRouter, ...) route it to the underlying provider's cache.
+        A caller-placed ``cachePoint`` block marks the preceding system text block as cacheable. By
+        default this emits OpenAI's own ``prompt_cache_breakpoint`` marker (honored on gpt-5.6 and
+        later; a harmless no-op on earlier models). Pass ``cache_strategy="anthropic"``, set via
+        ``CacheConfig(strategy="anthropic")``, to instead emit an Anthropic/Bedrock-compatible
+        ``cache_control`` field, for a gateway that proxies Chat Completions to Anthropic or Bedrock
+        and honors that field. A request with no cache point is unaffected either way.
         See https://github.com/strands-agents/harness-sdk/issues/1140.
 
         Args:
             system_prompt: System prompt to provide context to the model.
             system_prompt_content: System prompt content blocks to provide context to the model.
+            cache_strategy: ``cache_config.strategy``, if any. Only ``"anthropic"`` changes behavior.
             **kwargs: Additional keyword arguments for future extensibility.
 
         Returns:
@@ -387,24 +394,30 @@ class OpenAIModel(Model):
         if system_prompt and system_prompt_content is None:
             system_prompt_content = [{"text": system_prompt}]
 
-        formatted: list[dict[str, Any]] = []
-        for block in system_prompt_content or []:
+        if system_prompt_content is None or not any("cachePoint" in block for block in system_prompt_content):
+            return [
+                {"role": "system", "content": block["text"]} for block in system_prompt_content or [] if "text" in block
+            ]
+
+        # A cache point is present: collapse into a single system message with a content array (the
+        # shape the litellm provider already emits) rather than splitting the prefix across several
+        # system messages, which would leave the gateway to decide how to recombine them.
+        parts: list[dict[str, Any]] = []
+        for block in system_prompt_content:
             if "cachePoint" in block:
-                if formatted and isinstance(formatted[-1]["content"], str):
-                    formatted[-1]["content"] = [
-                        {
-                            "type": "text",
-                            "text": formatted[-1]["content"],
-                            "cache_control": cls._format_cache_control(block["cachePoint"].get("ttl")),
-                        }
-                    ]
-                else:
+                if not parts:
                     logger.warning("no preceding system text block accepts a cache point | skipped cache point")
+                elif "cache_control" in parts[-1] or "prompt_cache_breakpoint" in parts[-1]:
+                    logger.warning("stripped an extra system cache point | keeping the earlier point on the block")
+                elif cache_strategy == "anthropic":
+                    parts[-1]["cache_control"] = cls._format_cache_control(block["cachePoint"].get("ttl"))
+                else:
+                    parts[-1]["prompt_cache_breakpoint"] = cls._format_prompt_cache_breakpoint()
                 continue
             if "text" in block:
-                formatted.append({"role": "system", "content": block["text"]})
+                parts.append({"type": "text", "text": block["text"]})
 
-        return formatted
+        return [{"role": "system", "content": parts}] if parts else []
 
     @staticmethod
     def _format_cache_control(ttl: str | None) -> dict[str, Any]:
@@ -420,6 +433,18 @@ class OpenAIModel(Model):
         if ttl:
             cache_control["ttl"] = ttl
         return cache_control
+
+    @staticmethod
+    def _format_prompt_cache_breakpoint() -> dict[str, Any]:
+        """Build OpenAI's native explicit cache breakpoint marker for a system content part.
+
+        Unlike ``cache_control``, this carries no TTL: OpenAI's per-breakpoint lifetime is fixed by
+        the request-level ``prompt_cache_options.ttl`` (currently always 30m), not by the breakpoint.
+
+        Returns:
+            A prompt_cache_breakpoint dict.
+        """
+        return {"mode": "explicit"}
 
     @classmethod
     def _format_regular_messages(cls, messages: Messages, **kwargs: Any) -> list[dict[str, Any]]:
@@ -493,6 +518,7 @@ class OpenAIModel(Model):
         system_prompt: str | None = None,
         *,
         system_prompt_content: list[SystemContentBlock] | None = None,
+        cache_strategy: Literal["auto", "anthropic"] | None = None,
         **kwargs: Any,
     ) -> list[dict[str, Any]]:
         """Format an OpenAI compatible messages array.
@@ -501,12 +527,15 @@ class OpenAIModel(Model):
             messages: List of message objects to be processed by the model.
             system_prompt: System prompt to provide context to the model.
             system_prompt_content: System prompt content blocks to provide context to the model.
+            cache_strategy: ``cache_config.strategy``, if any; see ``_format_system_messages``.
             **kwargs: Additional keyword arguments for future extensibility.
 
         Returns:
             An OpenAI compatible messages array.
         """
-        formatted_messages = cls._format_system_messages(system_prompt, system_prompt_content=system_prompt_content)
+        formatted_messages = cls._format_system_messages(
+            system_prompt, system_prompt_content=system_prompt_content, cache_strategy=cache_strategy
+        )
         formatted_messages.extend(cls._format_regular_messages(messages))
 
         return [message for message in formatted_messages if "content" in message or "tool_calls" in message]
@@ -541,10 +570,14 @@ class OpenAIModel(Model):
         params = dict(cast(dict[str, Any], self.config.get("params") or {}))
         stream = bool(self.config.get("stream", params.pop("stream", True)))
         stream_options = params.pop("stream_options", {"include_usage": True})
+        cache_config = cast(CacheConfig | None, self.config.get("cache_config"))
 
         request = {
             "messages": self.format_request_messages(
-                messages, system_prompt, system_prompt_content=system_prompt_content
+                messages,
+                system_prompt,
+                system_prompt_content=system_prompt_content,
+                cache_strategy=cache_config.strategy if cache_config else None,
             ),
             "model": self.config["model_id"],
             "stream": stream,
@@ -566,7 +599,7 @@ class OpenAIModel(Model):
         if stream:
             request["stream_options"] = stream_options
 
-        apply_cache_config(request, cast(CacheConfig | None, self.config.get("cache_config")))
+        apply_cache_config(request, cache_config)
 
         return request
 
