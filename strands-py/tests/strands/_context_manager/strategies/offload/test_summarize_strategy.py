@@ -45,6 +45,7 @@ def mock_agent():
     agent.model.count_tokens = unittest.mock.AsyncMock(return_value=5000)
     agent.model.estimate_utilization = unittest.mock.MagicMock(return_value=0.9)
     agent.model.stream = _make_stream_events("Summary of content.")
+    agent.aux_model = agent.model
     agent.messages = []
     return agent
 
@@ -92,7 +93,7 @@ class TestSummarizeStrategyPerBlock:
     @pytest.mark.asyncio
     async def test_skips_when_no_model(self):
         agent = unittest.mock.MagicMock()
-        agent.model = None
+        agent.aux_model = None
         strategy = Offload.summarize("*").when(threshold=100)
         messages: Messages = [
             Message(role="user", content=[ContentBlock(text="pin")]),
@@ -149,7 +150,23 @@ class TestSummarizeStrategyPerBlock:
         mock_agent.messages = messages
         context = ContextState(messages=messages, agent=mock_agent, utilization=0.5)
         assert await strategy.apply(context) is True
-        assert "[Offloaded: ~" in messages[1]["content"][0]["text"]
+        assert "[Summarized:" in messages[1]["content"][0]["text"]
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_offloaded_when_media_summary_empty(self, mock_agent):
+        mock_agent.model.stream = _make_empty_stream()
+        strategy = Offload.summarize("*").when(threshold=100)
+        messages: Messages = [
+            Message(role="user", content=[ContentBlock(text="pin")]),
+            Message(
+                role="user",
+                content=[ContentBlock(image={"format": "png", "source": {"bytes": b"img"}})],
+            ),
+        ]
+        mock_agent.messages = messages
+        context = ContextState(messages=messages, agent=mock_agent, utilization=0.5)
+        assert await strategy.apply(context) is True
+        assert "[Offloaded:" in messages[1]["content"][0]["text"]
 
 
 class TestSummarizeStrategyMessageLevel:
@@ -218,7 +235,7 @@ class TestSummarizeStrategyMessageLevel:
     @pytest.mark.asyncio
     async def test_no_model_returns_false(self):
         agent = unittest.mock.MagicMock()
-        agent.model = None
+        agent.aux_model = None
         strategy = Offload.summarize("*").when(utilization=0.8)
         messages: Messages = [
             Message(role="user", content=[ContentBlock(text="pin")]),
